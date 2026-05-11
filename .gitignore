@@ -1,0 +1,24 @@
+# dependencies
+node_modules/
+
+# secrets — NEVER commit private keys
+.env
+.env.*
+!.env.example
+
+# compiled GPU binary
+src/gpu_miner.exe
+src/gpu_miner
+
+# WASM vendor blobs (large / auto-downloaded by refresh-miner)
+vendor/miner/hash_miner_bg.wasm
+vendor/miner/hash_miner.js
+
+# OS
+.DS_Store
+Thumbs.db
+
+# editors
+.vscode/
+*.swp
+
