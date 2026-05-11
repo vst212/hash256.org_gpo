@@ -1,17 +1,21 @@
 /*
- * keccak256_mine.cl
+ * keccak256_mine.cl  (optimized)
  *
- * OpenCL kernel: each work-item tries one nonce candidate.
- * Input layout (64 bytes):
- *   bytes[ 0.. 31] = challenge (32 bytes, from getChallenge(address))
- *   bytes[32.. 55] = nonce_prefix (24 bytes, fixed per worker launch)
- *   bytes[56.. 63] = base_counter + get_global_id(0)  (big-endian uint64)
+ * Key optimizations vs original:
+ *  1. Precompute state lanes 0-6 (challenge+prefix are fixed) outside inner loop.
+ *  2. Each work-item scans NONCES_PER_ITEM nonces — reduces kernel-launch overhead.
+ *  3. Early-exit uint32-word comparison — no need to materialise a hash[] byte array.
+ *  4. bswap + direct lane loading — no intermediate input[64] byte array on the stack.
  *
- * Success condition: keccak256(input) < difficulty  (big-endian uint256 compare)
- *
- * On hit: found_flag is set to 1 and found_counter holds the winning value.
- * Multiple simultaneous hits are harmless — any valid nonce is acceptable.
+ * Protocol (unchanged):
+ *   message = challenge(32) || nonce_prefix(24) || uint64_be(nonce)
+ *   hash    = keccak256(message)   [Keccak padding 0x01, NOT SHA3 0x06]
+ *   hit     = hash < difficulty    (big-endian uint256 compare)
  */
+
+#ifndef NONCES_PER_ITEM
+#define NONCES_PER_ITEM 64UL
+#endif
 
 /* ── Keccak-f[1600] round constants ─────────────────────────────────────── */
 __constant ulong RC[24] = {
@@ -27,7 +31,28 @@ __constant ulong RC[24] = {
 
 #define ROTL64(x, n) (((x) << (n)) | ((x) >> (64u - (n))))
 
-/* ── Keccak-f[1600] permutation ─────────────────────────────────────────── */
+/* ── Byte-swap helpers ───────────────────────────────────────────────────── */
+inline uint bswap32(uint v) {
+    return ((v & 0x000000FFu) << 24) | ((v & 0x0000FF00u) <<  8) |
+           ((v & 0x00FF0000u) >>  8) | ((v & 0xFF000000u) >> 24);
+}
+
+/* Load 8 bytes as a little-endian uint64 lane */
+inline ulong load_le64(__constant const uchar *p) {
+    return (ulong)p[0]        | ((ulong)p[1] <<  8) | ((ulong)p[2] << 16) |
+           ((ulong)p[3] << 24) | ((ulong)p[4] << 32) | ((ulong)p[5] << 40) |
+           ((ulong)p[6] << 48) | ((ulong)p[7] << 56);
+}
+
+/* Encode a uint64 counter as big-endian bytes → little-endian lane (= bswap64) */
+inline ulong nonce_to_lane(ulong v) {
+    return ((v & 0x00000000000000FFUL) << 56) | ((v & 0x000000000000FF00UL) << 40) |
+           ((v & 0x0000000000FF0000UL) << 24) | ((v & 0x00000000FF000000UL) <<  8) |
+           ((v & 0x000000FF00000000UL) >>  8) | ((v & 0x0000FF0000000000UL) >> 24) |
+           ((v & 0x00FF000000000000UL) >> 40) | ((v & 0xFF00000000000000UL) >> 56);
+}
+
+/* ── Keccak-f[1600] permutation (fully unrolled by compiler) ─────────────── */
 void keccak_f1600(ulong *st) {
     ulong C0, C1, C2, C3, C4;
     ulong D0, D1, D2, D3, D4;
@@ -95,54 +120,33 @@ void keccak_f1600(ulong *st) {
 }
 
 /*
- * keccak256 of exactly 64 bytes.
- * Output: 32 bytes in hash[].
+ * Early-exit big-endian uint256 compare: digest(st) < difficulty ?
+ * Compares 8 big-endian uint32 words derived from Keccak lanes without
+ * materialising a hash[] byte array.
  *
- * Rate = 136 bytes (1088 bits), capacity = 512 bits.
- * Padding for original keccak256: append 0x01, zero-fill, OR 0x80 to last byte.
+ * Keccak lane storage is little-endian:
+ *   hash_byte[n] = (st[n/8] >> (8*(n%8))) & 0xFF
+ * Big-endian word 0 = bswap32( (uint)(st[0]) )
+ * Big-endian word 1 = bswap32( (uint)(st[0] >> 32) )
+ * ... etc for st[1] lo/hi, st[2] lo/hi, st[3] lo/hi
  */
-void keccak256_64(const uchar *in, uchar *hash) {
-    ulong st[25];
+inline int digest_lt(__constant const uchar *diff, const ulong *st) {
+    uint h, d;
+#define CMP_WORD(lane, shift, di)                                              \
+    h = bswap32((uint)((st[lane] >> (shift)) & 0xFFFFFFFFUL));                 \
+    d = ((uint)diff[(di)*4]   << 24) | ((uint)diff[(di)*4+1] << 16) |         \
+        ((uint)diff[(di)*4+2] <<  8) |  (uint)diff[(di)*4+3];                 \
+    if (h != d) return (int)(h < d);
 
-    /* Zero the state */
-    for (int i = 0; i < 25; i++) st[i] = 0UL;
-
-    /* Absorb 64 bytes as 8 little-endian uint64 lanes */
-    for (int i = 0; i < 8; i++) {
-        ulong v = 0UL;
-        for (int j = 0; j < 8; j++)
-            v |= ((ulong)in[i * 8 + j]) << (j * 8);
-        st[i] = v;
-    }
-
-    /*
-     * Padding:
-     *   64 bytes of message already absorbed into st[0..7].
-     *   Rate = 136 bytes = 17 lanes.
-     *   First pad byte at position 64 → lane 8 byte 0 → st[8] |= 0x01
-     *   Last byte of rate at position 135 → lane 16 byte 7 → st[16] |= 0x80<<56
-     */
-    st[ 8] ^= 0x0000000000000001UL;
-    st[16] ^= 0x8000000000000000UL;
-
-    keccak_f1600(st);
-
-    /* Squeeze first 32 bytes (4 lanes) */
-    for (int i = 0; i < 4; i++) {
-        for (int j = 0; j < 8; j++)
-            hash[i * 8 + j] = (uchar)((st[i] >> (j * 8)) & 0xFFu);
-    }
-}
-
-/*
- * Big-endian uint256 comparison: hash < difficulty ?
- * hash[0] is the most-significant byte (matches Ethereum convention).
- */
-int hash_lt(const uchar *hash, __constant const uchar *diff) {
-    for (int i = 0; i < 32; i++) {
-        if (hash[i] < diff[i]) return 1;
-        if (hash[i] > diff[i]) return 0;
-    }
+    CMP_WORD(0,  0, 0)
+    CMP_WORD(0, 32, 1)
+    CMP_WORD(1,  0, 2)
+    CMP_WORD(1, 32, 3)
+    CMP_WORD(2,  0, 4)
+    CMP_WORD(2, 32, 5)
+    CMP_WORD(3,  0, 6)
+    CMP_WORD(3, 32, 7)
+#undef CMP_WORD
     return 0; /* equal → not less than */
 }
 
@@ -155,31 +159,48 @@ __kernel void mine(
     __global   int   *found_flag,   /* output: set to 1 on hit */
     __global   ulong *found_counter /* output: winning counter value */
 ) {
-    ulong tid        = (ulong)get_global_id(0);
-    ulong my_counter = base_counter + tid;
+    ulong tid      = (ulong)get_global_id(0);
+    ulong my_base  = base_counter + tid * NONCES_PER_ITEM;
 
-    /* Build 64-byte keccak input: challenge(32) || nonce_prefix(24) || counter_be(8) */
-    uchar input[64];
+    /*
+     * Precompute state lanes 0-6 from the FIXED part of the message
+     * (challenge[0..31] and nonce_prefix[0..23]).
+     * These 56 bytes map directly to 7 little-endian uint64 lanes.
+     * Only lane 7 changes per nonce (the 8-byte big-endian counter).
+     */
+    ulong s0 = load_le64(challenge + 0);
+    ulong s1 = load_le64(challenge + 8);
+    ulong s2 = load_le64(challenge + 16);
+    ulong s3 = load_le64(challenge + 24);
+    ulong s4 = load_le64(nonce_prefix + 0);
+    ulong s5 = load_le64(nonce_prefix + 8);
+    ulong s6 = load_le64(nonce_prefix + 16);
 
-    for (int i = 0; i < 32; i++) input[i]      = challenge[i];
-    for (int i = 0; i < 24; i++) input[32 + i]  = nonce_prefix[i];
+    for (ulong k = 0; k < NONCES_PER_ITEM; k++) {
+        ulong nonce = my_base + k;
 
-    /* Counter as big-endian uint64 */
-    input[56] = (uchar)(my_counter >> 56);
-    input[57] = (uchar)(my_counter >> 48);
-    input[58] = (uchar)(my_counter >> 40);
-    input[59] = (uchar)(my_counter >> 32);
-    input[60] = (uchar)(my_counter >> 24);
-    input[61] = (uchar)(my_counter >> 16);
-    input[62] = (uchar)(my_counter >>  8);
-    input[63] = (uchar)(my_counter      );
+        ulong st[25];
+        for (int i = 0; i < 25; i++) st[i] = 0UL;
 
-    uchar hash[32];
-    keccak256_64(input, hash);
+        /* Load fixed lanes */
+        st[0] = s0; st[1] = s1; st[2] = s2; st[3] = s3;
+        st[4] = s4; st[5] = s5; st[6] = s6;
 
-    if (hash_lt(hash, difficulty)) {
-        /* Mark hit — last writer wins; any valid nonce is fine */
-        *found_flag    = 1;
-        *found_counter = my_counter;
+        /* Lane 7: nonce encoded big-endian → little-endian lane */
+        st[7] = nonce_to_lane(nonce);
+
+        /* Keccak padding (rate=136, message=64 bytes) */
+        st[ 8] = 0x0000000000000001UL;
+        st[16] = 0x8000000000000000UL;
+
+        keccak_f1600(st);
+
+        if (digest_lt(difficulty, st)) {
+            /* atomic_cmpxchg guards against duplicate writes from two work-items */
+            if (atomic_cmpxchg((volatile __global int *)found_flag, 0, 1) == 0) {
+                *found_counter = nonce;
+            }
+            return; /* early exit — no need to try more nonces */
+        }
     }
 }
