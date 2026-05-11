@@ -6,13 +6,9 @@ node_modules/
 .env.*
 !.env.example
 
-# compiled GPU binary
+# compiled GPU binary (platform-specific, build locally)
 src/gpu_miner.exe
 src/gpu_miner
-
-# WASM vendor blobs (large / auto-downloaded by refresh-miner)
-vendor/miner/hash_miner_bg.wasm
-vendor/miner/hash_miner.js
 
 # OS
 .DS_Store
