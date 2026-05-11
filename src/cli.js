@@ -198,6 +198,15 @@ function formatHashrate(hps) {
   return `${value.toFixed(value >= 100 ? 0 : value >= 10 ? 1 : 2)} ${units[idx]}`;
 }
 
+function formatCount(n) {
+  if (!Number.isFinite(n) || n <= 0) return '?';
+  if (n >= 1e12) return `${(n / 1e12).toFixed(1)}T`;
+  if (n >= 1e9)  return `${(n / 1e9).toFixed(1)}B`;
+  if (n >= 1e6)  return `${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3)  return `${(n / 1e3).toFixed(1)}K`;
+  return n.toFixed(0);
+}
+
 function formatEta(seconds) {
   if (!Number.isFinite(seconds) || seconds <= 0) return '—';
   if (seconds < 60) return `${seconds.toFixed(0)}s`;
@@ -346,7 +355,10 @@ class MinerFarm {
     const { hashes, hashrate } = this.totals();
     const expected = this.current ? targetToExpectedHashes(this.current.difficultyHex) : Infinity;
     const eta = hashrate > 0 ? expected / hashrate : Infinity;
-    process.stdout.write(`\r[${new Date().toLocaleTimeString()}] ${formatHashrate(hashrate)} | hashes=${hashes.toLocaleString()} | eta≈${formatEta(eta)}     `);
+    const progress = Number.isFinite(expected) && expected > 0
+      ? ` | ${hashes.toLocaleString()} / ~${formatCount(expected)} (${Math.min(100, hashes / expected * 100).toFixed(1)}%)`
+      : ` | hashes=${hashes.toLocaleString()}`;
+    process.stdout.write(`\r[${new Date().toLocaleTimeString()}] ${formatHashrate(hashrate)}${progress} | eta≈${formatEta(eta)}     `);
   }
 
   #onMessage(state, msg) {
